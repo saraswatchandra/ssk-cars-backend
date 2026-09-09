@@ -45,7 +45,7 @@ app.post('/api/leads/parse', async (req, res) => {
     if (!rawText) return res.status(400).json({ success: false, error: 'rawText is required' });
 
     const response = await anthropic.messages.create({
-      model: 'claude-3-5-sonnet-20241022',
+      model: 'claude-3-5-sonnet-latest', // Fixed: Updated to standard latest alias
       max_tokens: 1000,
       system: `You are the Lead Parsing Engine for SSK Cars in Lucknow. Parse notes into raw JSON:
 {
