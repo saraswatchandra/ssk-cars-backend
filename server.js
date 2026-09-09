@@ -1,19 +1,19 @@
-import express from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import Anthropic from '@anthropic-ai/sdk';
-import { createClient } from '@supabase/supabase-js';
-
-dotenv.config();
+const express = require('express');
+const cors = require('cors');
+require('dotenv').config();
+const Anthropic = require('@anthropic-ai/sdk');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
 
+// Initialize Anthropic Claude SDK
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
+// Initialize Supabase Client
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const supabase = (supabaseUrl && supabaseKey) 
@@ -29,6 +29,7 @@ function parseClaudeJSON(text) {
   }
 }
 
+// Root Status Endpoint
 app.get('/', (req, res) => {
   res.json({
     status: 'SSK CARS AI Backend Running',
@@ -37,6 +38,7 @@ app.get('/', (req, res) => {
   });
 });
 
+// Feature 1: Lead Parse Endpoint
 app.post('/api/leads/parse', async (req, res) => {
   try {
     const { rawText, phone_number } = req.body;
@@ -61,7 +63,7 @@ app.post('/api/leads/parse', async (req, res) => {
 
     let savedRecord = null;
     if (supabase) {
-      const { data } = await supabase.from('leads').insert([{
+      const { data, error } = await supabase.from('leads').insert([{
         customer_name: parsedLead.customer_name || 'New Lead',
         phone_number: phone_number || null,
         budget_max: parsedLead.budget_max,
@@ -73,6 +75,7 @@ app.post('/api/leads/parse', async (req, res) => {
       }]).select();
 
       if (data) savedRecord = data[0];
+      if (error) console.error("Supabase Error:", error);
     }
 
     res.json({ success: true, extracted_lead: parsedLead, db_record: savedRecord });
