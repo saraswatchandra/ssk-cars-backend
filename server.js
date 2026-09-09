@@ -1,36 +1,85 @@
-const express = require('express');
-const cors = require('cors');
-require('dotenv').config();
+import express from 'express';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import Anthropic from '@anthropic-ai/sdk';
+import { createClient } from '@supabase/supabase-js';
+
+dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 5000;
-
-// Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '15mb' }));
 
-// Health Check Endpoint
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
+
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_ANON_KEY;
+const supabase = (supabaseUrl && supabaseKey) 
+  ? createClient(supabaseUrl, supabaseKey) 
+  : null;
+
+function parseClaudeJSON(text) {
+  try {
+    const cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
+    return JSON.parse(cleaned);
+  } catch (err) {
+    throw new Error('Failed to parse AI JSON response: ' + err.message);
+  }
+}
+
 app.get('/', (req, res) => {
-    res.status(200).json({
-        status: 'success',
-        message: 'SSK Cars Backend API Running',
-        environment: process.env.NODE_ENV || 'development',
-        timestamp: new Date().toISOString()
-    });
+  res.json({
+    status: 'SSK CARS AI Backend Running',
+    version: '1.0.0',
+    database_connected: !!supabase
+  });
 });
 
-// Sample API Routes
-app.get('/api/cars', (req, res) => {
-    res.status(200).json({
-        status: 'success',
-        data: [
-            { id: 1, make: 'Toyota', model: 'Camry', year: 2023, price: 25000, status: 'available' },
-            { id: 2, make: 'Honda', model: 'Civic', year: 2024, price: 22000, status: 'available' }
-        ]
+app.post('/api/leads/parse', async (req, res) => {
+  try {
+    const { rawText, phone_number } = req.body;
+    if (!rawText) return res.status(400).json({ success: false, error: 'rawText is required' });
+
+    const response = await anthropic.messages.create({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1000,
+      system: `You are the Lead Parsing Engine for SSK Cars in Lucknow. Parse notes into raw JSON:
+{
+  "customer_name": string or null,
+  "budget_max": number or null,
+  "target_models": string[],
+  "trade_in_car": string or null,
+  "financing_required": boolean,
+  "intent_score": number
+}`,
+      messages: [{ role: 'user', content: rawText }]
     });
+
+    const parsedLead = parseClaudeJSON(response.content[0].text);
+
+    let savedRecord = null;
+    if (supabase) {
+      const { data } = await supabase.from('leads').insert([{
+        customer_name: parsedLead.customer_name || 'New Lead',
+        phone_number: phone_number || null,
+        budget_max: parsedLead.budget_max,
+        target_models: parsedLead.target_models,
+        trade_in_car: parsedLead.trade_in_car,
+        financing_required: parsedLead.financing_required,
+        intent_score: parsedLead.intent_score || 50,
+        raw_transcript: rawText
+      }]).select();
+
+      if (data) savedRecord = data[0];
+    }
+
+    res.json({ success: true, extracted_lead: parsedLead, db_record: savedRecord });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
-// Start Server
-app.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
-});
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
