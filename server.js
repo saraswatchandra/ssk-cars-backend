@@ -8,12 +8,13 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
 
-// Initialize Anthropic Claude SDK
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-});
+// Clean API key of unintended spaces or quotes
+const cleanApiKey = process.env.ANTHROPIC_API_KEY 
+  ? process.env.ANTHROPIC_API_KEY.replace(/['"]/g, '').trim() 
+  : '';
 
-// Initialize Supabase Client
+const anthropic = new Anthropic({ apiKey: cleanApiKey });
+
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const supabase = (supabaseUrl && supabaseKey) 
@@ -29,7 +30,21 @@ function parseClaudeJSON(text) {
   }
 }
 
-// Root Status Endpoint
+// Fallback rule-based parser in case Anthropic API fails
+function fallbackParse(text) {
+  const nameMatch = text.match(/([A-Z][a-z]+\s[A-Z][a-z]+|[A-Z][a-z]+)/);
+  const budgetMatch = text.match(/(\d+)\s*(Lakhs|Lakh|L)/i);
+  
+  return {
+    customer_name: nameMatch ? nameMatch[0] : 'New Lead',
+    budget_max: budgetMatch ? parseInt(budgetMatch[1]) * 100000 : null,
+    target_models: ["Inquired Vehicle"],
+    trade_in_car: text.toLowerCase().includes('trade') || text.toLowerCase().includes('trading') ? 'Exchange Vehicle' : null,
+    financing_required: text.toLowerCase().includes('loan') || text.toLowerCase().includes('finance'),
+    intent_score: 75
+  };
+}
+
 app.get('/', (req, res) => {
   res.json({
     status: 'SSK CARS AI Backend Running',
@@ -38,16 +53,19 @@ app.get('/', (req, res) => {
   });
 });
 
-// Feature 1: Lead Parse Endpoint
 app.post('/api/leads/parse', async (req, res) => {
   try {
     const { rawText, phone_number } = req.body;
     if (!rawText) return res.status(400).json({ success: false, error: 'rawText is required' });
 
-    const response = await anthropic.messages.create({
-      model: 'claude-3-haiku-20240307', // Universally available across all Anthropic tiers
-      max_tokens: 1000,
-      system: `You are the Lead Parsing Engine for SSK Cars in Lucknow. Parse notes into raw JSON:
+    let parsedLead;
+    let usedFallback = false;
+
+    try {
+      const response = await anthropic.messages.create({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 1000,
+        system: `You are the Lead Parsing Engine for SSK Cars in Lucknow. Parse notes into raw JSON:
 {
   "customer_name": string or null,
   "budget_max": number or null,
@@ -56,10 +74,15 @@ app.post('/api/leads/parse', async (req, res) => {
   "financing_required": boolean,
   "intent_score": number
 }`,
-      messages: [{ role: 'user', content: rawText }]
-    });
+        messages: [{ role: 'user', content: rawText }]
+      });
 
-    const parsedLead = parseClaudeJSON(response.content[0].text);
+      parsedLead = parseClaudeJSON(response.content[0].text);
+    } catch (aiError) {
+      console.error("Anthropic API Error, switching to fallback parser:", aiError.message);
+      parsedLead = fallbackParse(rawText);
+      usedFallback = true;
+    }
 
     let savedRecord = null;
     if (supabase) {
@@ -75,10 +98,15 @@ app.post('/api/leads/parse', async (req, res) => {
       }]).select();
 
       if (data) savedRecord = data[0];
-      if (error) console.error("Supabase Error:", error);
+      if (error) console.error("Supabase Insertion Error:", error);
     }
 
-    res.json({ success: true, extracted_lead: parsedLead, db_record: savedRecord });
+    res.json({ 
+      success: true, 
+      extracted_lead: parsedLead, 
+      db_record: savedRecord,
+      fallback_used: usedFallback
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
