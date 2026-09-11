@@ -63,7 +63,7 @@ app.post('/api/leads/parse', async (req, res) => {
 
     try {
       const response = await anthropic.messages.create({
-       model: 'claude-3-haiku-20240307',
+      model: 'claude-3-5-haiku-latest',
         max_tokens: 1000,
         system: `You are the Lead Parsing Engine for SSK Cars in Lucknow. Parse notes into raw JSON:
 {
