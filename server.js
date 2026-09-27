@@ -5,30 +5,27 @@ require('dotenv').config();
 
 const app = express();
 
-// 1. CORS Middleware (Prevents Hoppscotch & Web Browser Preflight Errors)
+// 1. CORS Middleware
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, x-api-key, authorization');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
 
 app.use(express.json());
 
-// 2. Initialize Supabase Client
+// 2. Initialize Clients
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const supabase = (supabaseUrl && supabaseKey) ? createClient(supabaseUrl, supabaseKey) : null;
 
-// 3. Initialize Anthropic Client
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY
 });
 
-// 4. Authentication Guard Middleware
+// 3. API Key Auth Guard (for REST API)
 const authenticateApiKey = (req, res, next) => {
   const authHeader = req.headers['x-api-key'] || req.headers['authorization'];
   const secretKey = process.env.API_SECRET_KEY;
@@ -50,7 +47,7 @@ function parseClaudeJSON(text) {
   }
 }
 
-// Helper: Zero-Downtime Fallback Regex Parser
+// Helper: Zero-Downtime Fallback Parser
 function fallbackParse(rawText) {
   const nameMatch = rawText.match(/^([A-Z][a-z]+\s[A-Z][a-z]+)/);
   const budgetMatch = rawText.match(/(\d+)\s*(Lakhs|Lakh|L)/i);
@@ -70,21 +67,17 @@ function fallbackParse(rawText) {
   };
 }
 
-// 5. Lead Parsing API Endpoint
-app.post('/api/leads/parse', authenticateApiKey, async (req, res) => {
+// 4. Core Lead Processing & Storage Core Engine
+async function processAndSaveLead(rawText, phone_number) {
+  let parsedLead;
+  let usedFallback = false;
+
+  // Step A: Claude NLP Extraction
   try {
-    const { rawText, phone_number } = req.body;
-    if (!rawText) return res.status(400).json({ success: false, error: 'rawText is required' });
-
-    let parsedLead;
-    let usedFallback = false;
-
-    // Step A: Primary AI Extraction via Anthropic
-    try {
-      const response = await anthropic.messages.create({
-        model: 'claude-haiku-4-5',
-        max_tokens: 1000,
-        system: `You are the Lead Parsing Engine for SSK Cars in Lucknow. Parse raw dealer notes into this strict JSON format:
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5',
+      max_tokens: 1000,
+      system: `You are the Lead Parsing Engine for SSK Cars in Lucknow. Parse raw dealer notes into this strict JSON format:
 {
   "customer_name": string or null,
   "budget_max": number or null,
@@ -93,89 +86,143 @@ app.post('/api/leads/parse', authenticateApiKey, async (req, res) => {
   "financing_required": boolean,
   "intent_score": number (between 0.0 and 1.0)
 }`,
-        messages: [{ role: 'user', content: rawText }]
-      });
-
-      parsedLead = parseClaudeJSON(response.content[0].text);
-    } catch (aiError) {
-      console.error("Anthropic API Error:", aiError.message);
-      parsedLead = fallbackParse(rawText);
-      usedFallback = true;
-    }
-
-    // Step B: Supabase Storage with Phone Deduplication & Null Safety
-    let savedRecord = null;
-    let isDuplicateUpdate = false;
-
-    if (supabase) {
-      let existingLead = null;
-
-      // Check if lead exists by phone number
-      if (phone_number) {
-        const { data } = await supabase
-          .from('leads')
-          .select('*')
-          .eq('phone_number', phone_number)
-          .maybeSingle();
-
-        existingLead = data;
-      }
-
-      if (existingLead) {
-        // UPDATE EXISTING LEAD (Merge target car models & append transcript history)
-        isDuplicateUpdate = true;
-        
-        const mergedModels = Array.from(new Set([
-          ...(existingLead.target_models || []),
-          ...(parsedLead.target_models || [])
-        ]));
-
-        const updatedTranscript = `${existingLead.raw_transcript}\n\n[Follow-up Note]: ${rawText}`;
-
-        const { data, error } = await supabase
-          .from('leads')
-          .update({
-            customer_name: parsedLead.customer_name || existingLead.customer_name,
-            budget_max: parsedLead.budget_max || existingLead.budget_max,
-            target_models: mergedModels,
-            trade_in_car: parsedLead.trade_in_car || existingLead.trade_in_car,
-            financing_required: parsedLead.financing_required ?? existingLead.financing_required ?? false,
-            intent_score: parsedLead.intent_score || existingLead.intent_score,
-            raw_transcript: updatedTranscript
-          })
-          .eq('id', existingLead.id)
-          .select();
-
-        if (data) savedRecord = data[0];
-        if (error) console.error("Deduplication Update Error:", error);
-      } else {
-        // INSERT NEW LEAD (With null-safe financing_required fallback)
-        const { data, error } = await supabase.from('leads').insert([{
-          customer_name: parsedLead.customer_name || 'New Lead',
-          phone_number: phone_number || null,
-          budget_max: parsedLead.budget_max,
-          target_models: parsedLead.target_models,
-          trade_in_car: parsedLead.trade_in_car,
-          financing_required: parsedLead.financing_required ?? false,
-          intent_score: parsedLead.intent_score || 0.50,
-          raw_transcript: rawText
-        }]).select();
-
-        if (data) savedRecord = data[0];
-        if (error) console.error("Supabase Insertion Error:", error);
-      }
-    }
-
-    res.json({
-      success: true,
-      is_existing_lead_updated: isDuplicateUpdate,
-      extracted_lead: parsedLead,
-      db_record: savedRecord,
-      fallback_used: usedFallback
+      messages: [{ role: 'user', content: rawText }]
     });
 
+    parsedLead = parseClaudeJSON(response.content[0].text);
+  } catch (aiError) {
+    console.error("Anthropic API Error:", aiError.message);
+    parsedLead = fallbackParse(rawText);
+    usedFallback = true;
+  }
+
+  // Step B: Supabase Persistence with Deduplication
+  let savedRecord = null;
+  let isDuplicateUpdate = false;
+
+  if (supabase) {
+    let existingLead = null;
+
+    if (phone_number) {
+      const { data } = await supabase
+        .from('leads')
+        .select('*')
+        .eq('phone_number', phone_number)
+        .maybeSingle();
+
+      existingLead = data;
+    }
+
+    if (existingLead) {
+      isDuplicateUpdate = true;
+      const mergedModels = Array.from(new Set([
+        ...(existingLead.target_models || []),
+        ...(parsedLead.target_models || [])
+      ]));
+
+      const updatedTranscript = `${existingLead.raw_transcript}\n\n[WhatsApp Follow-up]: ${rawText}`;
+
+      const { data, error } = await supabase
+        .from('leads')
+        .update({
+          customer_name: parsedLead.customer_name || existingLead.customer_name,
+          budget_max: parsedLead.budget_max || existingLead.budget_max,
+          target_models: mergedModels,
+          trade_in_car: parsedLead.trade_in_car || existingLead.trade_in_car,
+          financing_required: parsedLead.financing_required ?? existingLead.financing_required ?? false,
+          intent_score: parsedLead.intent_score || existingLead.intent_score,
+          raw_transcript: updatedTranscript
+        })
+        .eq('id', existingLead.id)
+        .select();
+
+      if (data) savedRecord = data[0];
+      if (error) console.error("Deduplication Update Error:", error);
+    } else {
+      const { data, error } = await supabase.from('leads').insert([{
+        customer_name: parsedLead.customer_name || 'New Lead',
+        phone_number: phone_number || null,
+        budget_max: parsedLead.budget_max,
+        target_models: parsedLead.target_models,
+        trade_in_car: parsedLead.trade_in_car,
+        financing_required: parsedLead.financing_required ?? false,
+        intent_score: parsedLead.intent_score || 0.50,
+        raw_transcript: rawText
+      }]).select();
+
+      if (data) savedRecord = data[0];
+      if (error) console.error("Supabase Insertion Error:", error);
+    }
+  }
+
+  return {
+    is_existing_lead_updated: isDuplicateUpdate,
+    extracted_lead: parsedLead,
+    db_record: savedRecord,
+    fallback_used: usedFallback
+  };
+}
+
+// 5. REST Lead Parsing Endpoint (Manual / App Calls)
+app.post('/api/leads/parse', authenticateApiKey, async (req, res) => {
+  try {
+    const { rawText, phone_number } = req.body;
+    if (!rawText) return res.status(400).json({ success: false, error: 'rawText is required' });
+
+    const result = await processAndSaveLead(rawText, phone_number);
+    res.json({ success: true, ...result });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 6. Meta WhatsApp Webhook: GET Verification Handshake
+app.get('/api/whatsapp/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  const verifyToken = process.env.WHATSAPP_VERIFY_TOKEN;
+
+  if (mode === 'subscribe' && token === verifyToken) {
+    console.log("WhatsApp Webhook Verified Successfully!");
+    return res.status(200).send(challenge);
+  }
+  
+  return res.sendStatus(403);
+});
+
+// 7. Meta WhatsApp Webhook: POST Message Ingestion
+app.post('/api/whatsapp/webhook', async (req, res) => {
+  try {
+    const body = req.body;
+
+    // Verify event origin from WhatsApp Business Account
+    if (body.object === 'whatsapp_business_account') {
+      const entry = body.entry?.[0];
+      const changes = entry?.changes?.[0];
+      const value = changes?.value;
+      const message = value?.messages?.[0];
+
+      // Process only text messages
+      if (message && message.type === 'text') {
+        const fromPhoneNumber = `+${message.from}`; // Format e.g., +919999988888
+        const messageText = message.text.body;
+
+        console.log(`Received WhatsApp message from ${fromPhoneNumber}: "${messageText}"`);
+
+        // Asynchronously process lead in background
+        await processAndSaveLead(messageText, fromPhoneNumber);
+      }
+
+      // Always return 200 OK quickly to acknowledge receipt to Meta
+      return res.status(200).send('EVENT_RECEIVED');
+    }
+
+    res.sendStatus(404);
+  } catch (error) {
+    console.error('WhatsApp Webhook Error:', error.message);
+    res.status(500).send('Internal Server Error');
   }
 });
 
