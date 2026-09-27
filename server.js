@@ -4,19 +4,31 @@ const { Anthropic } = require('@anthropic-ai/sdk');
 require('dotenv').config();
 
 const app = express();
+
+// 1. CORS Middleware (Prevents Hoppscotch & Web Browser Preflight Errors)
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, x-api-key, authorization');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.use(express.json());
 
-// Initialize Supabase Client
+// 2. Initialize Supabase Client
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
 const supabase = (supabaseUrl && supabaseKey) ? createClient(supabaseUrl, supabaseKey) : null;
 
-// Initialize Anthropic Client
+// 3. Initialize Anthropic Client
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY
 });
 
-// Middleware: Authentication Guard
+// 4. Authentication Guard Middleware
 const authenticateApiKey = (req, res, next) => {
   const authHeader = req.headers['x-api-key'] || req.headers['authorization'];
   const secretKey = process.env.API_SECRET_KEY;
@@ -27,7 +39,7 @@ const authenticateApiKey = (req, res, next) => {
   next();
 };
 
-// JSON Parsing Helper for Claude Response
+// Helper: Parse Claude JSON Output
 function parseClaudeJSON(text) {
   try {
     const jsonMatch = text.match(/\{[\s\S]*\}/);
@@ -38,7 +50,7 @@ function parseClaudeJSON(text) {
   }
 }
 
-// Fallback Regex Parser for Zero-Downtime Resilience
+// Helper: Zero-Downtime Fallback Regex Parser
 function fallbackParse(rawText) {
   const nameMatch = rawText.match(/^([A-Z][a-z]+\s[A-Z][a-z]+)/);
   const budgetMatch = rawText.match(/(\d+)\s*(Lakhs|Lakh|L)/i);
@@ -58,7 +70,7 @@ function fallbackParse(rawText) {
   };
 }
 
-// Lead Parsing Endpoint
+// 5. Lead Parsing API Endpoint
 app.post('/api/leads/parse', authenticateApiKey, async (req, res) => {
   try {
     const { rawText, phone_number } = req.body;
@@ -67,7 +79,7 @@ app.post('/api/leads/parse', authenticateApiKey, async (req, res) => {
     let parsedLead;
     let usedFallback = false;
 
-    // 1. Primary AI Extraction via Anthropic
+    // Step A: Primary AI Extraction via Anthropic
     try {
       const response = await anthropic.messages.create({
         model: 'claude-haiku-4-5',
@@ -91,14 +103,14 @@ app.post('/api/leads/parse', authenticateApiKey, async (req, res) => {
       usedFallback = true;
     }
 
-    // 2. Supabase Storage with Phone Deduplication
+    // Step B: Supabase Storage with Phone Deduplication & Null Safety
     let savedRecord = null;
     let isDuplicateUpdate = false;
 
     if (supabase) {
       let existingLead = null;
 
-      // Check if lead already exists by phone number
+      // Check if lead exists by phone number
       if (phone_number) {
         const { data } = await supabase
           .from('leads')
@@ -110,7 +122,7 @@ app.post('/api/leads/parse', authenticateApiKey, async (req, res) => {
       }
 
       if (existingLead) {
-        // UPDATE EXISTING LEAD (Merge car models & append transcript)
+        // UPDATE EXISTING LEAD (Merge target car models & append transcript history)
         isDuplicateUpdate = true;
         
         const mergedModels = Array.from(new Set([
@@ -127,7 +139,7 @@ app.post('/api/leads/parse', authenticateApiKey, async (req, res) => {
             budget_max: parsedLead.budget_max || existingLead.budget_max,
             target_models: mergedModels,
             trade_in_car: parsedLead.trade_in_car || existingLead.trade_in_car,
-            financing_required: parsedLead.financing_required ?? existingLead.financing_required,
+            financing_required: parsedLead.financing_required ?? existingLead.financing_required ?? false,
             intent_score: parsedLead.intent_score || existingLead.intent_score,
             raw_transcript: updatedTranscript
           })
@@ -137,14 +149,14 @@ app.post('/api/leads/parse', authenticateApiKey, async (req, res) => {
         if (data) savedRecord = data[0];
         if (error) console.error("Deduplication Update Error:", error);
       } else {
-        // INSERT NEW LEAD
+        // INSERT NEW LEAD (With null-safe financing_required fallback)
         const { data, error } = await supabase.from('leads').insert([{
           customer_name: parsedLead.customer_name || 'New Lead',
           phone_number: phone_number || null,
           budget_max: parsedLead.budget_max,
           target_models: parsedLead.target_models,
           trade_in_car: parsedLead.trade_in_car,
-          financing_required: parsedLead.financing_required,
+          financing_required: parsedLead.financing_required ?? false,
           intent_score: parsedLead.intent_score || 0.50,
           raw_transcript: rawText
         }]).select();
