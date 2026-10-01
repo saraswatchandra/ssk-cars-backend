@@ -36,12 +36,14 @@ const authenticateApiKey = (req, res, next) => {
   next();
 };
 
-// Helper: Parse Claude JSON Output
+// Helper: Parse Claude JSON Output (Hardened for Markdown & Extra Text)
 function parseClaudeJSON(text) {
   try {
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    // Strip markdown code blocks if Claude includes them
+    let cleanText = text.replace(/```json/gi, '').replace(/```/g, '').trim();
+    const jsonMatch = cleanText.match(/\{[\s\S]*\}/);
     if (jsonMatch) return JSON.parse(jsonMatch[0]);
-    return JSON.parse(text);
+    return JSON.parse(cleanText);
   } catch (err) {
     throw new Error('Failed to parse Claude JSON output');
   }
@@ -77,7 +79,7 @@ async function processAndSaveLead(rawText, phone_number) {
     const response = await anthropic.messages.create({
       model: 'claude-haiku-4-5',
       max_tokens: 1000,
-      system: `You are the Lead Parsing Engine for SSK Cars in Lucknow. Parse raw dealer notes into this strict JSON format:
+      system: `You are the Lead Parsing Engine for SSK Cars in Lucknow. Parse raw dealer notes into this strict JSON format. IMPORTANT: Output ONLY valid JSON with no markdown backticks, no explanations, and no conversational filler.
 {
   "customer_name": string or null,
   "budget_max": number or null,
